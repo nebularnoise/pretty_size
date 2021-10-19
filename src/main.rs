@@ -155,21 +155,9 @@ fn main() {
 
     print_memory_sections(
         Config {
-            bootloader: matches
-                .value_of("bootloader-size")
-                .unwrap()
-                .parse::<u32>()
-                .unwrap(),
-            flash_size: matches
-                .value_of("flash-size")
-                .unwrap()
-                .parse::<u32>()
-                .unwrap(),
-            ram_size: matches
-                .value_of("ram-size")
-                .unwrap()
-                .parse::<u32>()
-                .unwrap(),
+            bootloader: size_from_str(matches.value_of("bootloader-size").unwrap()),
+            flash_size: size_from_str(matches.value_of("flash-size").unwrap()),
+            ram_size: size_from_str(matches.value_of("ram-size").unwrap()),
         },
         Sizes {
             program: program_size,
@@ -233,15 +221,29 @@ fn aligned<T: std::fmt::Display, U: std::fmt::Display>(
 }
 
 fn sizeof_fmt(num: u32) -> String {
-    let suffix = 'B';
-    let mut num = num as f32;
-    for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"] {
+    if num < 1024 {
+        return format!("{} B", num);
+    }
+    let mut num = num as f32 / 1024.0;
+    for unit in ["Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"] {
         if num.abs() < 1024.0 {
-            return format!("{:.2} {}{}", num, unit, suffix);
+            return format!("{:.2} {}B", num, unit);
         }
         num = num / 1024.0
     }
-    return format!("{:.2} {}{}", num, "Yi", suffix);
+    return format!("{:.2} YiB", num);
+}
+
+fn size_from_str(size: &str) -> u32 {
+    if let Some(idx) = size.find("KiB") {
+        let size = size[0..idx].trim().parse::<f32>().unwrap();
+        return (size * 1024_f32) as u32;
+    }
+    if let Some(idx) = size.find("MiB") {
+        let size = size[0..idx].trim().parse::<f32>().unwrap();
+        return (size * 1024_f32 * 1024_f32) as u32;
+    }
+    return size.trim().parse::<u32>().unwrap();
 }
 
 fn analyze_elf(elf: &str, size_prog: &str) -> (u32, u32, u32) {
@@ -409,4 +411,26 @@ fn print_memory_sections(config: Config, sizes: Sizes, previous_sizes: Option<Si
     );
     println!();
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn size_from_str() {
+        assert_eq!(crate::size_from_str("128 KiB"), 128 * 1024);
+        assert_eq!(crate::size_from_str("128.00 KiB"), 128 * 1024);
+        assert_eq!(crate::size_from_str("128 KiB  "), 128 * 1024);
+        assert_eq!(crate::size_from_str("128   KiB  "), 128 * 1024);
+        assert_eq!(crate::size_from_str("1.00   MiB  "), 1024 * 1024);
+        assert_eq!(crate::size_from_str("128   "), 128);
+    }
+
+    #[test]
+    fn sizeof_fmt() {
+        assert_eq!(crate::sizeof_fmt(32), "32 B");
+        assert_eq!(crate::sizeof_fmt(128), "128 B");
+        assert_eq!(crate::sizeof_fmt(1024), "1.00 KiB");
+        assert_eq!(crate::sizeof_fmt(1024 * 2), "2.00 KiB");
+        assert_eq!(crate::sizeof_fmt(1024 * 1024), "1.00 MiB");
+    }
 }
