@@ -1,4 +1,5 @@
 extern crate colored; // not needed in Rust 2018
+extern crate hex;
 
 use clap::{App, Arg};
 use colored::*;
@@ -123,7 +124,9 @@ fn main() {
     if !elf_path.exists() {
         panic!("{}: No such file", elf_path.display());
     }
-    let size_path = matches.value_of("size-pro").unwrap_or("arm-none-eabi-size");
+    let size_path = matches
+        .value_of("size-prog")
+        .unwrap_or("arm-none-eabi-size");
 
     let (program_size, stack_size, variables_size) = analyze_elf(elf_path_str, size_path);
     let build_dir = elf_path.parent().unwrap();
@@ -190,14 +193,18 @@ enum Align {
     Right,
 }
 
-fn aligned<T: std::fmt::Display, U: std::fmt::Display>(
+fn aligned<T, U>(
     title: &str,
     qt1: T,
     separator: &str,
     qt2: U,
     percent: &str,
     align: Align,
-) -> String {
+) -> String
+where
+    T: std::fmt::Display,
+    U: std::fmt::Display,
+{
     match align {
         Align::Left => format!(
             "{}:{:>width$}  {:1}{:<12}{:>7}",
@@ -235,6 +242,11 @@ fn sizeof_fmt(num: u32) -> String {
 }
 
 fn size_from_str(size: &str) -> u32 {
+    if size.trim().starts_with("0x") {
+        let without_prefix = size.trim_start_matches("0x");
+        return u32::from_str_radix(without_prefix, 16).unwrap();
+    }
+
     if let Some(idx) = size.find("KiB") {
         let size = size[0..idx].trim().parse::<f32>().unwrap();
         return (size * 1024_f32) as u32;
@@ -278,10 +290,10 @@ fn analyze_elf(elf: &str, size_prog: &str) -> (u32, u32, u32) {
 
 fn print_memory_sections(config: Config, sizes: Sizes, previous_sizes: Option<Sizes>) {
     let size_to_flash_ratio = |size: u32| (size as f32) / (config.flash_size as f32);
-    let ratio_to_bars = |ratio: f32| (ratio * BAR_LENGTH as f32) as u8;
-    let ratio_to_percent_str = |ratio: f32| ((ratio * 100.) as u8).to_string();
+    let ratio_to_bars = |ratio: f32| (ratio * BAR_LENGTH as f32).round() as u8;
+    let ratio_to_percent_str = |ratio: f32| ((ratio * 100.).round() as u8).to_string();
     let used_flash = sizes.program + config.bootloader;
-    let percent = (100. * size_to_flash_ratio(used_flash)) as u8;
+    let percent = (100. * size_to_flash_ratio(used_flash)).round() as u8;
 
     println!();
     println!();
