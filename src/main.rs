@@ -229,7 +229,7 @@ where
 
 fn sizeof_fmt(num: u32) -> String {
     if num < 1024 {
-        return format!("{} B", num);
+        return format!("{}", num);
     }
     let mut num = num as f32 / 1024.0;
     for unit in ["Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"] {
@@ -330,8 +330,8 @@ fn print_memory_sections(config: Config, sizes: Sizes, previous_sizes: Option<Si
             let diff = (sizes.program as i64) - (prev_s.program as i64);
             match diff >= 0 {
                 true if (diff == 0) => "".back(),
-                true => format!("+{}", diff.to_string()).yellow(),
-                false => diff.to_string().mint(),
+                true => format!("+{}", sizeof_fmt(diff as u32)).yellow(),
+                false => ("-".to_owned() + &sizeof_fmt((-diff) as u32)).mint(),
             }
         }
     };
@@ -394,8 +394,8 @@ fn print_memory_sections(config: Config, sizes: Sizes, previous_sizes: Option<Si
             let diff = (sizes.variables as i64) - (prev_s.variables as i64);
             match diff >= 0 {
                 true if (diff == 0) => "".back(),
-                true => format!("+{}", diff.to_string()).yellow(),
-                false => diff.to_string().mint(),
+                true => format!("+{}", sizeof_fmt(diff as u32)).yellow(),
+                false => ("-".to_owned() + &sizeof_fmt((-diff) as u32)).mint(),
             }
         }
     };
