@@ -1,17 +1,23 @@
 extern crate colored; // not needed in Rust 2018
-extern crate hex;
+extern crate ldscript_parser as lds;
 
-use clap::{App, Arg};
+use clap::{Arg, Command};
 use colored::*;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
-use std::process::Command;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RegionWithSections {
+    pub name: String,
+    pub length: u64,
+    pub sections: Vec<(String, u32)>,
+}
 
 pub trait CoolColor {
-    fn primary(self) -> ColoredString
+    fn s_purple(self) -> ColoredString
     where
         Self: Colorize + Sized,
     {
@@ -22,7 +28,7 @@ pub trait CoolColor {
         })
     }
 
-    fn secondary(self) -> ColoredString
+    fn s_pink(self) -> ColoredString
     where
         Self: Colorize + Sized,
     {
@@ -30,17 +36,6 @@ pub trait CoolColor {
             r: 255,
             g: 128,
             b: 221,
-        })
-    }
-    fn back(self) -> ColoredString
-    where
-        Self: Colorize + Sized,
-    {
-        let gray_level = 125;
-        self.color(Color::TrueColor {
-            r: gray_level,
-            g: gray_level,
-            b: gray_level,
         })
     }
 
@@ -59,63 +54,31 @@ impl<'a> CoolColor for &'a str {}
 
 const BAR_LENGTH: u8 = 47;
 
-#[derive(Debug)]
-struct Sizes {
-    program: u32,
-    stack: u32,
-    variables: u32,
-}
-struct Config {
-    flash_size: u32,
-    ram_size: u32,
-    bootloader: u32,
-}
-
 fn main() {
     const LAST_SIZE_FILE: &str = "fw-size.last";
-    let matches = App::new("pretty_size")
+    let matches = Command::new("pretty_size")
         .version("1.0")
         .author("Thibault Geoffroy <tg@nebularnoise.com>")
         .about("Rust re-write of wintertools/fw_size")
         .arg(
             Arg::new("elf")
                 .value_name("ELF FILE")
-                .about("Path to elf file")
+                .help("Path to elf file")
                 .takes_value(true)
                 .required(true),
+        )
+        .arg(
+            Arg::new("ld")
+                .long("ld")
+                .value_name("LD FILE")
+                .help("Path to linker script to parse")
+                .takes_value(true),
         )
         .arg(
             Arg::new("size-prog")
                 .long("size-prog")
-                .about("Path to size binary")
+                .help("Path to size binary")
                 .takes_value(true),
-        )
-        .arg(
-            Arg::new("flash-size")
-                .long("flash-size")
-                .about("Size of FLASH memory")
-                .takes_value(true)
-                .required(true),
-        )
-        .arg(
-            Arg::new("ram-size")
-                .long("ram-size")
-                .about("Size of RAM memory")
-                .takes_value(true)
-                .required(true),
-        )
-        .arg(
-            Arg::new("bootloader-size")
-                .long("bootloader-size")
-                .about("Size of bootloader")
-                .takes_value(true)
-                .required(true),
-        )
-        .arg(
-            Arg::new("human-readable")
-                .long("human-readable")
-                .short('H')
-                .about("Print sizes in human-readable format -- unused -- only for backwards compatibility"),
         )
         .get_matches();
 
@@ -128,12 +91,13 @@ fn main() {
         .value_of("size-prog")
         .unwrap_or("arm-none-eabi-size");
 
-    let (program_size, stack_size, variables_size) = analyze_elf(elf_path_str, size_path);
+    let linker_path = matches.value_of("ld").unwrap();
+
     let build_dir = elf_path.parent().unwrap();
     let last_file = build_dir.join(LAST_SIZE_FILE);
     let last_file = last_file.as_path();
 
-    let last_sizes: Option<Sizes> = if !last_file.exists() {
+    let last_sizes: Option<Vec<RegionWithSections>> = if !last_file.exists() {
         None
     } else {
         let display = last_file.display();
@@ -145,38 +109,18 @@ fn main() {
         if let Err(why) = file.read_to_string(&mut data) {
             panic!("couldn't read {}: {}", display, why);
         }
-        let last_data: Value = serde_json::from_str(&data).unwrap();
-        let last_program_size = last_data.get("program_size").unwrap().as_u64().unwrap();
-        let last_variables_size = last_data.get("variables_size").unwrap().as_u64().unwrap();
 
-        Some(Sizes {
-            program: last_program_size as u32,
-            stack: stack_size,
-            variables: last_variables_size as u32,
-        })
+        serde_json::from_str(&data).ok()
     };
 
-    print_memory_sections(
-        Config {
-            bootloader: size_from_str(matches.value_of("bootloader-size").unwrap()),
-            flash_size: size_from_str(matches.value_of("flash-size").unwrap()),
-            ram_size: size_from_str(matches.value_of("ram-size").unwrap()),
-        },
-        Sizes {
-            program: program_size,
-            stack: stack_size,
-            variables: variables_size,
-        },
-        last_sizes,
-    );
+    let sections = get_sections_sizes(elf_path_str, size_path);
+
+    let regions_with_sections = get_regions_and_sections_from_linker_script(linker_path, &sections);
+
+    print_memory_sections(&regions_with_sections, last_sizes.as_ref());
 
     // save to last size file
-    // The type of `john` is `serde_json::Value`
-    let to_save = json!({
-        "program_size": program_size,
-        "variables_size": variables_size,
-    })
-    .to_string();
+    let to_save = serde_json::to_string(&regions_with_sections).unwrap();
 
     let display = last_file.display();
     let mut file = match File::create(&last_file) {
@@ -241,25 +185,8 @@ fn sizeof_fmt(num: u32) -> String {
     return format!("{:.2} YiB", num);
 }
 
-fn size_from_str(size: &str) -> u32 {
-    if size.trim().starts_with("0x") {
-        let without_prefix = size.trim_start_matches("0x");
-        return u32::from_str_radix(without_prefix, 16).unwrap();
-    }
-
-    if let Some(idx) = size.find("KiB") {
-        let size = size[0..idx].trim().parse::<f32>().unwrap();
-        return (size * 1024_f32) as u32;
-    }
-    if let Some(idx) = size.find("MiB") {
-        let size = size[0..idx].trim().parse::<f32>().unwrap();
-        return (size * 1024_f32 * 1024_f32) as u32;
-    }
-    return size.trim().parse::<u32>().unwrap();
-}
-
-fn analyze_elf(elf: &str, size_prog: &str) -> (u32, u32, u32) {
-    let fw_size_output = Command::new(size_prog)
+fn get_sections_sizes(elf: &str, size_prog: &str) -> HashMap<String, u32> {
+    let fw_size_output = std::process::Command::new(size_prog)
         .args(["-A", "-d", elf])
         .output()
         .expect("failed to execute size");
@@ -274,169 +201,272 @@ fn analyze_elf(elf: &str, size_prog: &str) -> (u32, u32, u32) {
         let mut parts = line.split_whitespace();
         let section_name = parts.next().unwrap();
         let section_size = parts.next().unwrap().parse::<u32>().unwrap();
-        sections.insert(section_name, section_size);
+        if section_size == 0 {
+            continue;
+        }
+        if let Some(addr_str) = parts.next() {
+            if let Ok(addr) = addr_str.parse::<u32>() {
+                if addr == 0 {
+                    continue;
+                }
+                sections.insert(section_name.to_owned(), section_size);
+            }
+        }
     }
 
-    let program_size = sections.get(".text").unwrap_or(&0)
-        + sections.get(".relocate").unwrap_or(&0)
-        + sections.get(".data").unwrap_or(&0);
-
-    let stack_size = sections[".stack"];
-    let variables_size =
-        sections.get(".relocate").unwrap_or(&0) + sections[".data"] + sections[".bss"];
-
-    return (program_size, stack_size, variables_size);
+    return sections;
 }
 
-fn print_memory_sections(config: Config, sizes: Sizes, previous_sizes: Option<Sizes>) {
-    let size_to_flash_ratio = |size: u32| (size as f32) / (config.flash_size as f32);
-    let ratio_to_bars = |ratio: f32| (ratio * BAR_LENGTH as f32).round() as u8;
-    let ratio_to_percent_str = |ratio: f32| ((ratio * 100.).round() as u8).to_string();
-    let used_flash = sizes.program + config.bootloader;
-    let percent = (100. * size_to_flash_ratio(used_flash)).round() as u8;
+fn print_memory_sections(
+    regions: &Vec<RegionWithSections>,
+    regions_prev: Option<&Vec<RegionWithSections>>,
+) {
+    println!();
+    println!();
 
+    regions.iter().for_each(|reg| {
+        let prev_sections = regions_prev.and_then(|prev_reg| {
+            prev_reg
+                .iter()
+                .find(|reg_prev| reg_prev.name == reg.name)
+                .and_then(|reg_prev| Some(&reg_prev.sections))
+        });
+
+        let sections_with_diff = match &prev_sections {
+            None => reg
+                .sections
+                .iter()
+                .map(|(name, size)| (name.clone(), *size, 0))
+                .collect::<Vec<(String, u32, i64)>>(),
+            Some(prev_s) => reg
+                .sections
+                .iter()
+                .map(|(name, size)| {
+                    let previous_size = prev_s
+                        .iter()
+                        .find(|&(prev_name, _)| name == prev_name)
+                        .and_then(|(_, prev_size)| Some(*prev_size))
+                        .unwrap_or(0);
+                    (name.clone(), *size, *size as i64 - previous_size as i64)
+                })
+                .collect::<Vec<(String, u32, i64)>>(),
+        };
+
+        print_region(reg.name.as_str(), reg.length as u32, &sections_with_diff);
+    });
     println!();
     println!();
+}
+
+fn print_region(name: &str, region_size: u32, sections: &Vec<(String, u32, i64)>) {
+    let total_usage: u32 = sections.iter().fold(0, |acc, x| acc + x.1);
+    let size_to_ratio = |size: u32| (size as f32) / (region_size as f32);
+    let percent = (100. * size_to_ratio(total_usage)).round() as u8;
     println!(
         "{}",
         aligned(
-            "Flash used",
-            sizeof_fmt(used_flash).primary(),
+            format!("{} used", name).as_str(),
+            sizeof_fmt(total_usage).s_purple(),
             "/",
-            sizeof_fmt(config.flash_size),
+            sizeof_fmt(region_size),
             &percent.to_string(),
             Align::Right
         )
     );
-    let bootloader_ratio = size_to_flash_ratio(config.bootloader);
-    let bootloader_bars = ratio_to_bars(bootloader_ratio);
-    let program_ratio = size_to_flash_ratio(sizes.program);
-    let program_bars = ratio_to_bars(program_ratio);
-    println!(
-        "{}{}{}",
-        (0..bootloader_bars)
-            .map(|_| "▓")
-            .collect::<String>()
-            .secondary(),
-        (0..program_bars).map(|_| "▓").collect::<String>().primary(),
-        (program_bars + bootloader_bars..BAR_LENGTH)
-            .map(|_| "░")
-            .collect::<String>()
-            .back()
-    );
-    let added = match &previous_sizes {
-        None => "".back(),
-        Some(prev_s) => {
-            let diff = (sizes.program as i64) - (prev_s.program as i64);
-            match diff >= 0 {
-                true if (diff == 0) => "".back(),
-                true => format!("+{}", sizeof_fmt(diff as u32)).yellow(),
-                false => ("-".to_owned() + &sizeof_fmt((-diff) as u32)).mint(),
-            }
-        }
-    };
-    println!(
-        "{}\n{}\n\n",
-        aligned(
-            "Bootloader",
-            sizeof_fmt(config.bootloader),
-            "",
-            "",
-            &ratio_to_percent_str(bootloader_ratio),
-            Align::Left
-        )
-        .secondary(),
-        aligned(
-            "Program",
-            sizeof_fmt(sizes.program),
-            "",
-            added,
-            &ratio_to_percent_str(program_ratio),
-            Align::Left
-        )
-        .primary(),
-    );
 
-    let size_to_ram_ratio = |size: u32| (size as f32) / (config.ram_size as f32);
-    let used_ram = sizes.stack + sizes.variables;
-    let used_ram_ratio = size_to_ram_ratio(used_ram);
+    let bars = sections
+        .iter()
+        .map(|&(_, ssize, _)| {
+            let ratio = size_to_ratio(ssize);
+            (ratio * BAR_LENGTH as f32).round() as u8
+        })
+        .collect::<Vec<u8>>();
+
+    bars.iter().enumerate().for_each(|(i, val)| {
+        let uncolored_bar = (0..*val).map(|_| "▓").collect::<String>();
+        match i % 2 == 0 {
+            true => print!("{}", uncolored_bar.s_pink()),
+            _ => print!("{}", uncolored_bar.s_purple()),
+        }
+    });
+
+    let used_bars: u8 = bars.iter().sum();
     println!(
         "{}",
-        aligned(
-            "RAM used",
-            sizeof_fmt(used_ram).primary(),
-            "/",
-            sizeof_fmt(config.ram_size),
-            &ratio_to_percent_str(used_ram_ratio),
-            Align::Right
-        )
-    );
-    let stack_ratio = size_to_ram_ratio(sizes.stack);
-    let stack_bars = ratio_to_bars(stack_ratio);
-    let variables_ratio = size_to_ram_ratio(sizes.variables);
-    let variables_bars = ratio_to_bars(variables_ratio);
-    println!(
-        "{}{}{}",
-        (0..stack_bars).map(|_| "▓").collect::<String>().secondary(),
-        (0..variables_bars)
-            .map(|_| "▓")
-            .collect::<String>()
-            .primary(),
-        (stack_bars + variables_bars..BAR_LENGTH)
-            .map(|_| "░")
-            .collect::<String>()
-            .back()
+        (used_bars..BAR_LENGTH).map(|_| "░").collect::<String>()
     );
 
-    let added = match &previous_sizes {
-        None => "".back(),
-        Some(prev_s) => {
-            let diff = (sizes.variables as i64) - (prev_s.variables as i64);
-            match diff >= 0 {
-                true if (diff == 0) => "".back(),
-                true => format!("+{}", sizeof_fmt(diff as u32)).yellow(),
+    let ratio_to_percent_str = |ratio: f32| ((ratio * 100.).round() as u8).to_string();
+
+    sections
+        .iter()
+        .enumerate()
+        .for_each(|(i, (name, size, diff))| {
+            let ratio = size_to_ratio(*size);
+
+            let diff_string = match *diff >= 0 {
+                true if (*diff == 0) => "".black(),
+                true => format!("+{}", sizeof_fmt(*diff as u32)).yellow(),
                 false => ("-".to_owned() + &sizeof_fmt((-diff) as u32)).mint(),
-            }
-        }
-    };
+            };
 
-    println!(
-        "{}\n{}",
-        aligned(
-            "Stack",
-            sizeof_fmt(sizes.stack),
-            "",
-            "",
-            &ratio_to_percent_str(stack_ratio),
-            Align::Left
-        )
-        .secondary(),
-        aligned(
-            "Variables",
-            sizeof_fmt(sizes.variables),
-            "",
-            added,
-            &ratio_to_percent_str(variables_ratio),
-            Align::Left
-        )
-        .primary()
-    );
+            let uncolored = aligned(
+                name.as_str(),
+                sizeof_fmt(*size),
+                "",
+                diff_string,
+                &ratio_to_percent_str(ratio),
+                Align::Left,
+            );
+
+            match i % 2 == 0 {
+                true => println!("{}", uncolored.s_pink()),
+                _ => println!("{}", uncolored.s_purple()),
+            }
+        });
     println!();
-    println!();
+}
+
+fn drain_filter<T, F>(vec: &mut Vec<T>, predicate: F) -> Vec<T>
+where
+    F: Fn(&mut T) -> bool,
+{
+    let mut ret: Vec<T> = vec![];
+    let mut i = 0;
+    while i < vec.len() {
+        if predicate(&mut vec[i]) {
+            ret.push(vec.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    ret
+}
+
+fn get_regions_and_sections_from_linker_script(
+    linker_path: &str,
+    sections_sizes: &HashMap<String, u32>,
+) -> Vec<RegionWithSections> {
+    let script = &mut String::new();
+    File::open(linker_path)
+        .unwrap()
+        .read_to_string(script)
+        .unwrap();
+
+    let parsed_vec = lds::parse(script).unwrap();
+
+    // mem regions
+    let regions = parsed_vec
+        .iter()
+        .filter_map(|item| match item {
+            lds::RootItem::Memory { regions } => Some(regions),
+            _ => None,
+        })
+        .next()
+        .unwrap();
+
+    // println!("{:#?}", regions);
+
+    let sections: Vec<(&String, &String, Option<&String>)> = parsed_vec
+        .iter()
+        .filter_map(|item| match item {
+            lds::RootItem::Sections { list } => Some(list),
+            _ => None,
+        })
+        .flat_map(|e| e.iter())
+        .filter_map(|sec_command| match sec_command {
+            lds::SectionCommand::OutputSection {
+                name,
+                region,
+                lma_region,
+                ..
+            } => Some((name, region, lma_region)),
+            _ => None,
+        })
+        .filter(|(_, reg, _)| reg.is_some())
+        .map(|(name, reg, lma_reg)| (name, reg.as_ref().unwrap(), lma_reg.as_ref()))
+        .collect();
+    // println!("{:#?}", sections);
+
+    let mut regions_better: Vec<RegionWithSections> = regions
+        .iter()
+        .map(|reg| {
+            let mut sections: Vec<(String, u32)> = sections
+                .iter()
+                .filter(|&&(_name, reg_name, lma_reg_name)| {
+                    (reg_name == &reg.name)
+                        || (lma_reg_name.map_or("", |s| s.as_str()) == reg.name.as_str())
+                })
+                .filter_map(|&(name, ..)| match sections_sizes.get(name.as_str()) {
+                    Some(size) => match size {
+                        0 => None,
+                        _ => Some((name.clone(), *size)),
+                    },
+                    _ => None,
+                })
+                .collect();
+
+            let misc_sections = drain_filter(&mut sections, |(_name, size)| {
+                let percentage = 100.0 * (*size as f64) / (reg.length as f64);
+                percentage < 2.0
+            });
+
+            if !misc_sections.is_empty() {
+                let misc_size = misc_sections
+                    .iter()
+                    .fold(0u32, |acc, &(_, size)| acc + size);
+
+                sections.push(("miscellaneous".to_owned(), misc_size));
+            }
+
+            RegionWithSections {
+                name: reg.name.clone(),
+                length: reg.length,
+                sections: sections,
+            }
+        })
+        .collect();
+
+    // group bootloader & FLASH
+    if let Some(index) = regions_better
+        .iter()
+        .position(|reg| &reg.name == "bootloader")
+    {
+        let bootloader_reg = regions_better.remove(index);
+        if let Some(reg) = regions_better.iter_mut().find(|reg| &reg.name == "FLASH") {
+            reg.sections
+                .insert(0, (".bootloader".to_owned(), bootloader_reg.length as u32));
+            reg.length += bootloader_reg.length;
+        }
+    }
+
+    regions_better.iter_mut().for_each(|reg| {
+        if let Some(index) = reg
+            .sections
+            .iter()
+            .position(|(sec_name, _)| sec_name == ".padding")
+        {
+            reg.sections.remove(index);
+        }
+    });
+
+    // group DMA_RAM & RAM
+    if let Some(index) = regions_better.iter().position(|reg| &reg.name == "DMA_RAM") {
+        let dma_ram_reg = regions_better.remove(index);
+        if let Some(reg) = regions_better.iter_mut().find(|reg| &reg.name == "RAM") {
+            reg.sections
+                .insert(0, (".dma_ram".to_owned(), dma_ram_reg.length as u32));
+            reg.length += dma_ram_reg.length;
+        }
+    }
+
+    // regions_better.sort_by(|a, b| a.origin.cmp(&b.origin));
+
+    return regions_better;
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn size_from_str() {
-        assert_eq!(crate::size_from_str("128 KiB"), 128 * 1024);
-        assert_eq!(crate::size_from_str("128.00 KiB"), 128 * 1024);
-        assert_eq!(crate::size_from_str("128 KiB  "), 128 * 1024);
-        assert_eq!(crate::size_from_str("128   KiB  "), 128 * 1024);
-        assert_eq!(crate::size_from_str("1.00   MiB  "), 1024 * 1024);
-        assert_eq!(crate::size_from_str("128   "), 128);
-    }
-
     #[test]
     fn sizeof_fmt() {
         assert_eq!(crate::sizeof_fmt(32), "32 B");
