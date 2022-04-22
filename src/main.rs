@@ -16,6 +16,19 @@ struct RegionWithSections {
     pub sections: Vec<(String, u32)>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+enum SectionEdit {
+    GroupRegions {
+        region_to_insert_as_section: String,
+        output_region: String,
+        output_section_name: String,
+    },
+    Ignore {
+        region_name: String,
+        section_name_to_ignore: String,
+    },
+}
+
 pub trait CoolColor {
     fn s_purple(self) -> ColoredString
     where
@@ -80,6 +93,13 @@ fn main() {
                 .help("Path to size binary")
                 .takes_value(true),
         )
+        .arg(
+            Arg::new("section-edits")
+                .long("section edits")
+                .short('e')
+                .help("Path to the json file describing operations to apply to group regions and ignore sections in the generated report")
+                .takes_value(true),
+        )
         .get_matches();
 
     let elf_path_str = matches.value_of("elf").unwrap();
@@ -115,7 +135,11 @@ fn main() {
 
     let sections = get_sections_sizes(elf_path_str, size_path);
 
-    let regions_with_sections = get_regions_and_sections_from_linker_script(linker_path, &sections);
+    let edits_file = matches.value_of("section-edits").unwrap_or("");
+    let edits_file = Path::new(edits_file);
+
+    let regions_with_sections =
+        get_regions_and_sections_from_linker_script(linker_path, &sections, edits_file);
 
     print_memory_sections(&regions_with_sections, last_sizes.as_ref());
 
@@ -246,7 +270,7 @@ fn print_memory_sections(
                         .iter()
                         .find(|&(prev_name, _)| name == prev_name)
                         .and_then(|(_, prev_size)| Some(*prev_size))
-                        .unwrap_or(0);
+                        .unwrap_or(*size);
                     (name.clone(), *size, *size as i64 - previous_size as i64)
                 })
                 .collect::<Vec<(String, u32, i64)>>(),
@@ -346,6 +370,7 @@ where
 fn get_regions_and_sections_from_linker_script(
     linker_path: &str,
     sections_sizes: &HashMap<String, u32>,
+    edits_file: &Path,
 ) -> Vec<RegionWithSections> {
     let script = &mut String::new();
     File::open(linker_path)
@@ -427,42 +452,73 @@ fn get_regions_and_sections_from_linker_script(
         })
         .collect();
 
-    // group bootloader & FLASH
-    if let Some(index) = regions_better
-        .iter()
-        .position(|reg| &reg.name == "bootloader")
-    {
-        let bootloader_reg = regions_better.remove(index);
-        if let Some(reg) = regions_better.iter_mut().find(|reg| &reg.name == "FLASH") {
-            reg.sections
-                .insert(0, (".bootloader".to_owned(), bootloader_reg.length as u32));
-            reg.length += bootloader_reg.length;
-        }
+    let section_edits = get_section_edits(edits_file);
+
+    if section_edits.is_some() {
+        let section_edits = section_edits.unwrap();
+
+        section_edits.iter().for_each(|s_e| match s_e {
+            SectionEdit::GroupRegions {
+                region_to_insert_as_section,
+                output_region,
+                output_section_name,
+            } => {
+                if let Some(index) = regions_better
+                    .iter()
+                    .position(|reg| &reg.name == region_to_insert_as_section)
+                {
+                    let bootloader_reg = regions_better.remove(index);
+                    if let Some(reg) = regions_better
+                        .iter_mut()
+                        .find(|reg| &reg.name == output_region)
+                    {
+                        reg.sections.insert(
+                            0,
+                            (output_section_name.clone(), bootloader_reg.length as u32),
+                        );
+                        reg.length += bootloader_reg.length;
+                    }
+                }
+            }
+            SectionEdit::Ignore {
+                region_name,
+                section_name_to_ignore,
+            } => {
+                if let Some(reg) = regions_better
+                    .iter_mut()
+                    .find(|reg| &reg.name == region_name)
+                {
+                    if let Some(index) = reg
+                        .sections
+                        .iter()
+                        .position(|(sec_name, _)| sec_name == section_name_to_ignore)
+                    {
+                        reg.sections.remove(index);
+                    }
+                }
+            }
+        });
     }
-
-    regions_better.iter_mut().for_each(|reg| {
-        if let Some(index) = reg
-            .sections
-            .iter()
-            .position(|(sec_name, _)| sec_name == ".padding")
-        {
-            reg.sections.remove(index);
-        }
-    });
-
-    // group DMA_RAM & RAM
-    if let Some(index) = regions_better.iter().position(|reg| &reg.name == "DMA_RAM") {
-        let dma_ram_reg = regions_better.remove(index);
-        if let Some(reg) = regions_better.iter_mut().find(|reg| &reg.name == "RAM") {
-            reg.sections
-                .insert(0, (".dma_ram".to_owned(), dma_ram_reg.length as u32));
-            reg.length += dma_ram_reg.length;
-        }
-    }
-
-    // regions_better.sort_by(|a, b| a.origin.cmp(&b.origin));
 
     return regions_better;
+}
+
+fn get_section_edits(edits_file: &Path) -> Option<Vec<SectionEdit>> {
+    if !edits_file.exists() {
+        return None;
+    }
+
+    let display = edits_file.display();
+    let mut file = match File::open(&edits_file) {
+        Err(why) => panic!("couldn't open {}: {}", display, why),
+        Ok(file) => file,
+    };
+    let mut data = String::new();
+    if let Err(why) = file.read_to_string(&mut data) {
+        panic!("couldn't read {}: {}", display, why);
+    }
+
+    serde_json::from_str(&data).ok()
 }
 
 #[cfg(test)]
