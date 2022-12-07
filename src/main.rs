@@ -1,6 +1,7 @@
 extern crate colored; // not needed in Rust 2018
 extern crate ldscript_parser as lds;
 
+use anyhow::{Context, Result};
 use clap::{Arg, Command};
 use colored::*;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
+
+use anyhow::anyhow;
+use anyhow::ensure;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct RegionWithSections {
@@ -67,10 +71,10 @@ impl<'a> CoolColor for &'a str {}
 
 const BAR_LENGTH: u8 = 47;
 
-fn main() {
+fn main() -> Result<()> {
     const LAST_SIZE_FILE: &str = "fw-size.last";
     let matches = Command::new("pretty_size")
-        .version("1.0")
+        .version("1.0.1")
         .author("Thibault Geoffroy <tg@nebularnoise.com>")
         .about("Rust re-write of wintertools/fw_size")
         .arg(
@@ -85,7 +89,8 @@ fn main() {
                 .long("ld")
                 .value_name("LD FILE")
                 .help("Path to linker script to parse")
-                .takes_value(true),
+                .takes_value(true)
+                .required(true),
         )
         .arg(
             Arg::new("size-prog")
@@ -104,14 +109,12 @@ fn main() {
 
     let elf_path_str = matches.value_of("elf").unwrap();
     let elf_path = Path::new(elf_path_str);
-    if !elf_path.exists() {
-        panic!("{}: No such file", elf_path.display());
-    }
+    ensure!(elf_path.exists(), "{}: No such file", elf_path.display());
     let size_path = matches
         .value_of("size-prog")
         .unwrap_or("arm-none-eabi-size");
 
-    let linker_path = matches.value_of("ld").unwrap();
+    let linker_script_path = matches.value_of("ld").unwrap();
 
     let build_dir = elf_path.parent().unwrap();
     let last_file = build_dir.join(LAST_SIZE_FILE);
@@ -121,39 +124,43 @@ fn main() {
         None
     } else {
         let display = last_file.display();
-        let mut file = match File::open(&last_file) {
-            Err(why) => panic!("couldn't open {}: {}", display, why),
-            Ok(file) => file,
-        };
+        let mut file =
+            File::open(&last_file).with_context(|| format!("Couldn't open {}", display))?;
+
         let mut data = String::new();
-        if let Err(why) = file.read_to_string(&mut data) {
-            panic!("couldn't read {}: {}", display, why);
-        }
+        file.read_to_string(&mut data)
+            .with_context(|| format!("Couldn't read {}", display))?;
 
         serde_json::from_str(&data).ok()
     };
 
-    let sections = get_sections_sizes(elf_path_str, size_path);
+    let sections = get_sections_sizes(elf_path_str, size_path).with_context(|| {
+        format!(
+            "Could not read sections of file \"{}\" with executable \"{}\"",
+            elf_path_str, size_path
+        )
+    })?;
 
     let edits_file = matches.value_of("section-edits").unwrap_or("");
     let edits_file = Path::new(edits_file);
 
     let regions_with_sections =
-        get_regions_and_sections_from_linker_script(linker_path, &sections, edits_file);
+        get_regions_and_sections_from_linker_script(linker_script_path, &sections, edits_file)
+            .with_context(|| "Failed to fetch regions and sections from linker script")?;
 
     print_memory_sections(&regions_with_sections, last_sizes.as_ref());
 
     // save to last size file
-    let to_save = serde_json::to_string(&regions_with_sections).unwrap();
+    let to_save = serde_json::to_string(&regions_with_sections)
+        .with_context(|| "Failed to serialize size information")?;
 
     let display = last_file.display();
-    let mut file = match File::create(&last_file) {
-        Err(why) => panic!("couldn't open {} with write priliveges: {}", display, why),
-        Ok(file) => file,
-    };
-    if let Err(why) = file.write_all(to_save.as_bytes()) {
-        panic!("couldn't write to {}: {}", display, why);
-    }
+    let mut file =
+        File::create(&last_file).with_context(|| format!("Could not write to {}", display))?;
+    file.write_all(to_save.as_bytes())
+        .with_context(|| format!("Could not write to {}", display))?;
+
+    Ok(())
 }
 
 enum Align {
@@ -209,13 +216,13 @@ fn sizeof_fmt(num: u32) -> String {
     return format!("{:.2} YiB", num);
 }
 
-fn get_sections_sizes(elf: &str, size_prog: &str) -> HashMap<String, u32> {
+fn get_sections_sizes(elf: &str, size_prog: &str) -> Result<HashMap<String, u32>> {
     let fw_size_output = std::process::Command::new(size_prog)
         .args(["-A", "-d", elf])
         .output()
         .expect("failed to execute size");
 
-    let fw_size_output = String::from_utf8(fw_size_output.stdout).unwrap();
+    let fw_size_output = String::from_utf8(fw_size_output.stdout)?;
     let mut sections = HashMap::new();
 
     for line in fw_size_output.lines().skip(2) {
@@ -238,7 +245,7 @@ fn get_sections_sizes(elf: &str, size_prog: &str) -> HashMap<String, u32> {
         }
     }
 
-    return sections;
+    return Ok(sections);
 }
 
 fn print_memory_sections(
@@ -368,17 +375,23 @@ where
 }
 
 fn get_regions_and_sections_from_linker_script(
-    linker_path: &str,
+    linker_script_path: &str,
     sections_sizes: &HashMap<String, u32>,
     edits_file: &Path,
-) -> Vec<RegionWithSections> {
+) -> Result<Vec<RegionWithSections>> {
     let script = &mut String::new();
-    File::open(linker_path)
-        .unwrap()
+    File::open(linker_script_path)
+        .with_context(|| format!("Invalid linker script path \"{}\"", linker_script_path))?
         .read_to_string(script)
-        .unwrap();
+        .with_context(|| {
+            format!(
+                "Could not read linker script \"{}\" as string",
+                linker_script_path
+            )
+        })?;
 
-    let parsed_vec = lds::parse(script).unwrap();
+    let parsed_vec = lds::parse(script)
+        .map_err(|_| anyhow!("Failed to parse linker script \"{}\"", linker_script_path))?;
 
     // mem regions
     let regions = parsed_vec
@@ -388,9 +401,7 @@ fn get_regions_and_sections_from_linker_script(
             _ => None,
         })
         .next()
-        .unwrap();
-
-    // println!("{:#?}", regions);
+        .with_context(|| "Could not find REGIONS")?;
 
     let sections: Vec<(&String, &String, Option<&String>)> = parsed_vec
         .iter()
@@ -452,11 +463,9 @@ fn get_regions_and_sections_from_linker_script(
         })
         .collect();
 
-    let section_edits = get_section_edits(edits_file);
+    let section_edits = get_section_edits(edits_file)?;
 
-    if section_edits.is_some() {
-        let section_edits = section_edits.unwrap();
-
+    if let Some(section_edits) = section_edits {
         section_edits.iter().for_each(|s_e| match s_e {
             SectionEdit::GroupRegions {
                 region_to_insert_as_section,
@@ -500,25 +509,23 @@ fn get_regions_and_sections_from_linker_script(
         });
     }
 
-    return regions_better;
+    return Ok(regions_better);
 }
 
-fn get_section_edits(edits_file: &Path) -> Option<Vec<SectionEdit>> {
+fn get_section_edits(edits_file: &Path) -> Result<Option<Vec<SectionEdit>>> {
     if !edits_file.exists() {
-        return None;
+        return Ok(None);
     }
 
     let display = edits_file.display();
-    let mut file = match File::open(&edits_file) {
-        Err(why) => panic!("couldn't open {}: {}", display, why),
-        Ok(file) => file,
-    };
-    let mut data = String::new();
-    if let Err(why) = file.read_to_string(&mut data) {
-        panic!("couldn't read {}: {}", display, why);
-    }
+    let mut file = File::open(&edits_file)
+        .with_context(|| format!("Couldn't open edits file \"{}\"", display))?;
 
-    serde_json::from_str(&data).ok()
+    let mut data = String::new();
+    file.read_to_string(&mut data)
+        .with_context(|| format!("Couldn't read edits file \"{}\"", display))?;
+
+    Ok(serde_json::from_str(&data).ok())
 }
 
 #[cfg(test)]
