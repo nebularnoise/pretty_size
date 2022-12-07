@@ -69,7 +69,7 @@ SDRAM (xrw)     : ORIGIN = 0xC0000000, LENGTH = 0x2000000
 
 This is just to illustrate two things:
 
-- Firstly, I had to put all the origin and sizes in hex, as the `ldscript-parser` crate seemed to not like the `2M`/ `64k`, etc. syntax
+- ~~Firstly, I had to put all the origin and sizes in hex, as the `ldscript-parser` crate seemed to not like the `2M`/ `64k`, etc. syntax~~ (EDIT: actually, `ldscript-parser` does not support expressions, so arithmetic in ORIGIN and LENGTH was the culprit.
 - Secondly, this example will be referenced in the following section.
 
 ## Section edits
