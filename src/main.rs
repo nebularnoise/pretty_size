@@ -1,17 +1,18 @@
-extern crate colored; // not needed in Rust 2018
 extern crate ldscript_parser as lds;
 
+use anyhow::anyhow;
+use anyhow::bail;
+use anyhow::ensure;
 use anyhow::{Context, Result};
 use clap::{Arg, Command};
 use colored::*;
+use path_clean::PathClean;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
 use std::fs::File;
 use std::io::prelude::*;
-use std::path::Path;
-
-use anyhow::anyhow;
-use anyhow::ensure;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct RegionWithSections {
@@ -513,11 +514,15 @@ fn get_regions_and_sections_from_linker_script(
 }
 
 fn get_section_edits(edits_file: &Path) -> Result<Option<Vec<SectionEdit>>> {
-    if !edits_file.exists() {
-        return Ok(None);
-    }
-
     let display = edits_file.display();
+    if !edits_file.exists() {
+        let edits_file_absolute_path = absolute_path(edits_file)
+            .with_context(|| format!("Couldn't resolve edits file path \"{}\"", display))?;
+        bail!(
+            "Section edits file does not exist: {:?}",
+            edits_file_absolute_path
+        );
+    }
     let mut file = File::open(&edits_file)
         .with_context(|| format!("Couldn't open edits file \"{}\"", display))?;
 
@@ -526,6 +531,19 @@ fn get_section_edits(edits_file: &Path) -> Result<Option<Vec<SectionEdit>>> {
         .with_context(|| format!("Couldn't read edits file \"{}\"", display))?;
 
     Ok(serde_json::from_str(&data).ok())
+}
+
+pub fn absolute_path(path: impl AsRef<Path>) -> Result<PathBuf> {
+    let path = path.as_ref();
+
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    }
+    .clean();
+
+    Ok(absolute_path)
 }
 
 #[cfg(test)]
