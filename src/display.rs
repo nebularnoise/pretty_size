@@ -1,3 +1,98 @@
+/*
+OUTPUT EXAMPLE:
+
+FLASH_1 used:  170.82 KiB  /  512.00 KiB  (33%)
+▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+.text:         124.68 KiB   +24           (24%)
+
+
+
+THE FORMAT
+====================
+
+            FLASH_1 used:  170.82 KiB  /  512.00 KiB  (33%)
+            DTCMRAM used:  128.00 KiB  /  128.00 KiB (100%)
+            ^           ^                          ^      ^
+            +-----------+                          |      |
+            TITLE_WIDTH                            |      |
+                                                   |      |
+                         ^                         |      |
+                         +-------------------------+      |
+                              SIZE_INFO_WIDTH             |
+                                                    ^     |
+                                                    +-----+
+                                                    USAGE_WIDTH
+
+*/
+
+// tweakable
+const TITLE_WIDTH: usize = 18;
+const USAGE_WIDTH: usize = 7;
+const SINGLE_SIZE_WIDTH: usize = 10;
+const TITLE_SUFFIX: &str = ": ";
+
+// computed
+const SIZE_INFO_WIDTH: usize = 2 * SINGLE_SIZE_WIDTH + 5;
+const FULL_LINE_WIDTH: usize = TITLE_WIDTH + SIZE_INFO_WIDTH + USAGE_WIDTH;
+
+fn size_info_section<T, U>(used_space: T, separator: &str, total_space: U) -> String
+where
+    T: std::fmt::Display,
+    U: std::fmt::Display,
+{
+    format!(
+        "{:>SINGLE_SIZE_WIDTH$}  {:1}  {:<SINGLE_SIZE_WIDTH$}",
+        used_space, separator, total_space
+    )
+}
+
+fn region_format<T, U>(title: &str, used_space: T, total_space: U, percent: u8) -> String
+where
+    T: std::fmt::Display,
+    U: std::fmt::Display,
+{
+    let size_info = size_info_section(used_space, "/", total_space);
+    let usage = format!("({}%)", percent);
+    let title = title_format(title);
+    format!(
+        "{:<TITLE_WIDTH$}{}{:>USAGE_WIDTH$}",
+        title, size_info, usage
+    )
+}
+
+fn title_format(title: &str) -> String {
+    let max_title_length = TITLE_WIDTH - TITLE_SUFFIX.chars().count();
+
+    if title.chars().count() > max_title_length {
+        format!(
+            "{:.ellipsisized_title_length$}…{}",
+            title,
+            TITLE_SUFFIX,
+            ellipsisized_title_length = max_title_length - 1
+        )
+    } else {
+        format!("{:.max_title_length$}{}", title, TITLE_SUFFIX)
+    }
+}
+
+fn diff_section_format<T>(
+    section_name: &str,
+    used_space: u32,
+    diff_string: T,
+    percent: u8,
+) -> String
+where
+    T: std::fmt::Display,
+{
+    let size_info = size_info_section(sizeof_fmt(used_space), "", diff_string);
+    let usage = format!("({}%)", percent);
+    let title = title_format(section_name);
+    format!(
+        "{:<TITLE_WIDTH$}{}{:>USAGE_WIDTH$}",
+        title, size_info, usage
+    )
+}
+
 use colored::*;
 trait CoolColor {
     fn s_purple(self) -> ColoredString
@@ -35,8 +130,6 @@ trait CoolColor {
 }
 impl<'a> CoolColor for &'a str {}
 
-const BAR_LENGTH: u8 = 47;
-
 use crate::size::Section;
 pub fn print_region(name: &str, region_size: u32, sections: &[(Section, i64)]) {
     let total_usage: u32 = sections.iter().fold(0, |acc, x| acc + x.0 .1);
@@ -44,13 +137,11 @@ pub fn print_region(name: &str, region_size: u32, sections: &[(Section, i64)]) {
     let percent = (100. * size_to_ratio(total_usage)).round() as u8;
     println!(
         "{}",
-        aligned(
+        region_format(
             format!("{} used", name).as_str(),
             sizeof_fmt(total_usage).s_purple(),
-            "/",
             sizeof_fmt(region_size),
-            &percent.to_string(),
-            Align::Right
+            percent
         )
     );
 
@@ -58,7 +149,7 @@ pub fn print_region(name: &str, region_size: u32, sections: &[(Section, i64)]) {
         .iter()
         .map(|&(Section(_, size), _)| {
             let ratio = size_to_ratio(size);
-            (ratio * BAR_LENGTH as f32).round() as u8
+            (ratio * FULL_LINE_WIDTH as f32).round() as u8
         })
         .collect::<Vec<u8>>();
 
@@ -73,10 +164,10 @@ pub fn print_region(name: &str, region_size: u32, sections: &[(Section, i64)]) {
     let used_bars: u8 = bars.iter().sum();
     println!(
         "{}",
-        (used_bars..BAR_LENGTH).map(|_| "░").collect::<String>()
+        (used_bars..(FULL_LINE_WIDTH as u8))
+            .map(|_| "░")
+            .collect::<String>()
     );
-
-    let ratio_to_percent_str = |ratio: f32| ((ratio * 100.).round() as u8).to_string();
 
     sections
         .iter()
@@ -93,13 +184,11 @@ pub fn print_region(name: &str, region_size: u32, sections: &[(Section, i64)]) {
                 }
             };
 
-            let uncolored = aligned(
+            let uncolored = diff_section_format(
                 name.as_str(),
-                sizeof_fmt(*size),
-                "",
+                *size,
                 diff_string,
-                &ratio_to_percent_str(ratio),
-                Align::Left,
+                (ratio * 100.).round() as u8,
             );
 
             match i % 2 == 0 {
@@ -108,45 +197,6 @@ pub fn print_region(name: &str, region_size: u32, sections: &[(Section, i64)]) {
             }
         });
     println!();
-}
-
-enum Align {
-    Left,
-    Right,
-}
-
-fn aligned<T, U>(
-    title: &str,
-    qt1: T,
-    separator: &str,
-    qt2: U,
-    percent: &str,
-    align: Align,
-) -> String
-where
-    T: std::fmt::Display,
-    U: std::fmt::Display,
-{
-    match align {
-        Align::Left => format!(
-            "{}:{:>width$}  {:1}{:<12}{:>7}",
-            title,
-            qt1,
-            separator,
-            qt2,
-            format!("({}%)", percent),
-            width = (24 - title.len())
-        ),
-        Align::Right => format!(
-            "{}:{:>width$}  {:1}{:>12}{:>7}",
-            title,
-            qt1,
-            separator,
-            qt2,
-            format!("({}%)", percent),
-            width = (24 - title.len())
-        ),
-    }
 }
 
 fn sizeof_fmt(num: u32) -> String {
